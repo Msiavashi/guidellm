@@ -18,9 +18,9 @@ from __future__ import annotations
 import asyncio
 import random
 from abc import abstractmethod
-from multiprocessing import Event, Value, synchronize
+from multiprocessing import Event, Lock, Value, synchronize
 from multiprocessing.sharedctypes import Synchronized
-from typing import Annotated, ClassVar, Literal, TypeVar
+from typing import Annotated, Any, ClassVar, Literal, TypeVar
 
 from pydantic import Field, NonNegativeFloat, NonNegativeInt, PositiveInt, PrivateAttr
 
@@ -30,6 +30,7 @@ from guidellm.utils import InfoMixin
 __all__ = [
     "AsyncConstantStrategy",
     "AsyncPoissonStrategy",
+    "BurstyStrategy",
     "ConcurrentStrategy",
     "SchedulingStrategy",
     "StrategyT",
@@ -40,7 +41,7 @@ __all__ = [
 
 
 StrategyType = Annotated[
-    Literal["synchronous", "concurrent", "throughput", "constant", "poisson"],
+    Literal["synchronous", "concurrent", "throughput", "constant", "poisson", "bursty"],
     "Valid strategy type identifiers for scheduling request patterns",
 ]
 
@@ -615,3 +616,303 @@ class AsyncPoissonStrategy(SchedulingStrategy):
         :param request_info: Completed request metadata (unused)
         """
         _ = request_info  # request_info unused for async poisson strategy
+
+
+@SchedulingStrategy.register("bursty")
+class BurstyStrategy(SchedulingStrategy):
+    """
+    Time-varying rate scheduling that switches between phases during execution.
+
+    Dynamically switches between constant and poisson rates based on elapsed time,
+    creating bursty workload patterns. Phases are defined with specific rates and
+    durations, and can repeat multiple times.
+    """
+
+    type_: Literal["bursty"] = "bursty"  # type: ignore[assignment]
+    phases: list[dict[str, Any]] = Field(  # type: ignore[type-arg]
+        description="List of phase configurations with model, rate, and duration",
+    )
+    repeat: PositiveInt = Field(
+        default=1,
+        description="Number of times to repeat the phase sequence",
+    )
+    max_concurrency: PositiveInt | None = Field(
+        default=None,
+        description="Maximum number of concurrent requests to schedule",
+    )
+    random_seed: int = Field(
+        default=42,
+        description="Random seed for Poisson distribution phases",
+    )
+
+    _random: random.Random | None = PrivateAttr(None)
+    _offset = PrivateAttr(None)
+    _processes_lock: Lock | None = PrivateAttr(None)
+    _phase_start_times: list[float] | None = PrivateAttr(None)
+    _phase_duration: float | None = PrivateAttr(None)
+    _last_phase_index: int = PrivateAttr(-1)
+    _total_duration: float | None = PrivateAttr(None)
+
+    def _get_start_time_sync(self) -> float | None:
+        """
+        Get start time synchronously (for use in __str__ and display).
+        
+        :return: Start time if available, None otherwise
+        """
+        # Try cached first
+        if self._cached_processes_start_time is not None:
+            return self._cached_processes_start_time
+        
+        # Try to get from processes_start_time if lock is available
+        if self._processes_start_time is not None and self._processes_lock is not None:
+            try:
+                with self._processes_lock:
+                    if self._processes_start_time.value != -1.0:
+                        # Cache it for next time
+                        self._cached_processes_start_time = self._processes_start_time.value
+                        return self._processes_start_time.value
+            except Exception:
+                pass
+        
+        return None
+
+    def get_phase_info(self) -> str:
+        """
+        Get current phase information as a string.
+        
+        :return: String describing current phase, repeat, and remaining repeats
+        """
+        try:
+            import time as time_module
+            
+            start_time = self._get_start_time_sync()
+            if start_time is None or self._phase_start_times is None:
+                return f"bursty({len(self.phases)} phases, {self.repeat} repeats)"
+            
+            current_time = time_module.time()
+            elapsed_time = current_time - start_time
+            
+            # Find current phase
+            phase_index = 0
+            for i, phase_start in enumerate(self._phase_start_times):
+                if elapsed_time >= phase_start:
+                    phase_index = i
+                else:
+                    break
+            
+            # Clamp phase_index to valid range
+            if phase_index >= len(self._phase_start_times):
+                phase_index = len(self._phase_start_times) - 1
+            
+            # Calculate which repeat cycle we're in
+            repeat_num = (phase_index // len(self.phases)) + 1
+            phase_in_repeat = (phase_index % len(self.phases)) + 1
+            
+            # Calculate remaining repeats
+            if phase_index >= len(self._phase_start_times) - 1:
+                # Check if we're past the last phase
+                last_phase_start = self._phase_start_times[-1]
+                last_phase = self.phases[-1]
+                if elapsed_time >= last_phase_start + last_phase["duration"]:
+                    remaining_repeats = 0
+                else:
+                    remaining_repeats = 0  # In last phase
+            else:
+                remaining_repeats = max(0, self.repeat - repeat_num)
+            
+            phase = self.phases[phase_index % len(self.phases)]
+            phase_type = phase["model"]
+            phase_rate = phase["rate"]
+            
+            return f"bursty(phase {phase_in_repeat}/{len(self.phases)}: {phase_type}@{phase_rate:.0f}, repeat {repeat_num}/{self.repeat}, {remaining_repeats} left)"
+        except Exception:
+            return f"bursty({len(self.phases)} phases, {self.repeat} repeats)"
+
+    def __str__(self) -> str:
+        """
+        :return: String identifier for bursty strategy with current phase info
+        """
+        return self.get_phase_info()
+
+    @property
+    def processes_limit(self) -> PositiveInt | None:
+        """
+        :return: Max concurrency if set, otherwise None for unlimited
+        """
+        return self.max_concurrency
+
+    @property
+    def requests_limit(self) -> PositiveInt | None:
+        """
+        :return: Max concurrency if set, otherwise None for unlimited
+        """
+        return self.max_concurrency
+
+    def init_processes_timings(self, worker_count: int, max_concurrency: int):
+        """
+        Initialize bursty strategy timing state.
+
+        Sets up shared offset value for coordinating request timing across worker processes
+        and calculates phase boundaries.
+
+        :param worker_count: Number of worker processes to coordinate
+        :param max_concurrency: Maximum number of concurrent requests allowed
+        """
+        super().init_processes_timings(worker_count, max_concurrency)
+        if self._processes_lock is None:
+            raise RuntimeError("_processes_lock is None in init_processes_timings")
+        with self._processes_lock:
+            self._offset = Value("d", -1.0)
+
+        # Calculate phase start times
+        self._phase_start_times = []
+        self._phase_duration = sum(phase["duration"] for phase in self.phases)
+        current_time = 0.0
+        for _ in range(self.repeat):
+            for phase in self.phases:
+                self._phase_start_times.append(current_time)
+                current_time += phase["duration"]
+        self._total_duration = current_time
+
+    def init_processes_start(self, start_time: float):
+        """
+        Initialize the offset time for timing calculations.
+
+        :param start_time: Unix timestamp when request processing should begin
+        """
+        super().init_processes_start(start_time)
+
+        if self._processes_lock is None:
+            raise RuntimeError("_processes_lock is None in init_processes_start")
+        if self._offset is None:
+            raise RuntimeError(
+                "_offset is None in init_processes_start; was "
+                "init_processes_timings not called?"
+            )
+        with self._processes_lock:
+            self._offset.value = start_time
+
+    def _get_current_phase(self, elapsed_time: float) -> tuple[dict[str, Any], float, int]:
+        """
+        Determine the current phase based on elapsed time.
+
+        :param elapsed_time: Time elapsed since start in seconds
+        :return: Tuple of (current phase configuration, elapsed time within current phase, phase_index)
+        """
+        if self._phase_start_times is None:
+            raise RuntimeError("Phase start times not initialized")
+
+        # Find which phase we're in
+        phase_index = 0
+        for i, phase_start in enumerate(self._phase_start_times):
+            if elapsed_time >= phase_start:
+                phase_index = i
+            else:
+                break
+
+        # Clamp to valid range
+        if phase_index >= len(self._phase_start_times):
+            phase_index = len(self._phase_start_times) - 1
+
+        # Get the phase configuration (accounting for repeats)
+        phase_config_index = phase_index % len(self.phases)
+        phase = self.phases[phase_config_index]
+        
+        # Calculate elapsed time within current phase
+        phase_start_time = self._phase_start_times[phase_index]
+        phase_elapsed = elapsed_time - phase_start_time
+        
+        # Clamp phase_elapsed to phase duration to handle edge cases
+        phase_elapsed = min(phase_elapsed, phase["duration"])
+        phase_elapsed = max(0.0, phase_elapsed)  # Ensure non-negative
+        
+        return phase, phase_elapsed, phase_index
+
+    async def next_request_time(self, worker_index: PositiveInt) -> float:
+        """
+        Calculate next request time based on current phase.
+
+        Dynamically switches between constant and poisson rates based on elapsed time.
+
+        :param worker_index: Unused for bursty strategy
+        :return: Next arrival time based on current phase
+        """
+        _ = worker_index  # unused
+        start_time = await self.get_processes_start_time()
+
+        if self._processes_lock is None:
+            raise RuntimeError(
+                "_processes_lock is None in next_request_time; was "
+                "init_processes_timings not called?"
+            )
+        if self._offset is None:
+            raise RuntimeError(
+                "_offset is None in next_request_time; was "
+                "init_processes_timings not called?"
+            )
+
+        # Get current time to determine phase
+        import time as time_module
+        current_time = time_module.time()
+        elapsed_time = current_time - start_time
+
+        # Get current phase configuration, elapsed time within phase, and phase index
+        phase, phase_elapsed, phase_index = self._get_current_phase(elapsed_time)
+
+        with self._processes_lock:
+            if phase["model"] == "constant":
+                # Constant rate: use uniform intervals based on phase elapsed time
+                phase_start_time = self._phase_start_times[phase_index] if self._phase_start_times else 0.0
+                
+                # Calculate how many requests should have been sent in this phase
+                requests_in_phase = int(phase_elapsed * phase["rate"])
+                
+                # Calculate the time for the next request in this phase
+                next_request_offset_in_phase = (requests_in_phase + 1) / phase["rate"]
+                next_request_time_absolute = start_time + phase_start_time + next_request_offset_in_phase
+                
+                # Ensure we don't schedule in the past
+                if next_request_time_absolute <= current_time:
+                    # We're behind schedule, schedule the next request slightly in the future
+                    # Calculate how many requests should be scheduled by now
+                    requests_by_now = int((current_time - (start_time + phase_start_time)) * phase["rate"])
+                    next_request_offset_in_phase = (requests_by_now + 1) / phase["rate"]
+                    next_request_time_absolute = start_time + phase_start_time + next_request_offset_in_phase
+                    # Ensure it's at least slightly in the future
+                    if next_request_time_absolute <= current_time:
+                        next_request_time_absolute = current_time + 0.001
+                
+                return next_request_time_absolute
+                
+            elif phase["model"] == "poisson":
+                # Poisson rate: use exponential distribution
+                if self._random is None:
+                    self._random = random.Random(self.random_seed)
+
+                if self._offset is None:
+                    raise RuntimeError("_offset is None in next_request_time for poisson phase")
+
+                # Reset offset when entering a new poisson phase
+                if phase_index != self._last_phase_index:
+                    # Set offset to current time to start fresh in new phase
+                    self._offset.value = current_time
+                    self._last_phase_index = phase_index
+
+                next_delay = self._random.expovariate(phase["rate"])
+                self._offset.value += next_delay
+                
+                # Ensure we don't schedule in the past
+                if self._offset.value <= current_time:
+                    self._offset.value = current_time + next_delay
+                
+                return self._offset.value
+            else:
+                raise ValueError(f"Invalid phase model: {phase['model']}")
+
+    def request_completed(self, request_info: RequestInfo):
+        """
+        Handle request completion (no-op for bursty strategy).
+
+        :param request_info: Completed request metadata (unused)
+        """
+        _ = request_info  # request_info unused for bursty strategy

@@ -324,6 +324,8 @@ async def resolve_profile(
     max_error_rate: float | None,
     max_global_error_rate: float | None,
     over_saturation: dict[str, Any] | None = None,
+    phases: str | None = None,
+    repeat: int = 1,
     console: Console | None = None,
 ) -> Profile:
     """
@@ -367,12 +369,20 @@ async def resolve_profile(
             constraints[key] = val
 
     if not isinstance(profile, Profile):
+        profile_kwargs: dict[str, Any] = {
+            "rampup_duration": rampup,
+            "constraints": {**constraints},
+        }
+        # Add phases and repeat for bursty profile
+        if phases is not None:
+            profile_kwargs["phases"] = phases
+        if repeat is not None:
+            profile_kwargs["repeat"] = repeat
         profile = Profile.create(
             rate_type=profile,
             rate=rate,
             random_seed=random_seed,
-            rampup_duration=rampup,
-            constraints={**constraints},
+            **profile_kwargs,
         )
     elif constraints:
         raise ValueError(
@@ -504,6 +514,8 @@ async def benchmark_generative_text(
         max_error_rate=args.max_error_rate,
         max_global_error_rate=args.max_global_error_rate,
         over_saturation=args.over_saturation,
+        phases=args.phases,
+        repeat=args.repeat,
         console=console,
     )
     output_formats = await resolve_output_formats(

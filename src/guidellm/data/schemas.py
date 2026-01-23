@@ -9,6 +9,7 @@ from guidellm.schemas import StandardBaseModel
 __all__ = [
     "DataConfig",
     "DataNotSupportedError",
+    "DistributionDatasetConfig",
     "GenerativeDatasetColumnType",
     "SyntheticTextDatasetConfig",
     "SyntheticTextPrefixBucketConfig",
@@ -171,5 +172,63 @@ class SyntheticTextDatasetConfig(DataConfig):
                         prefix_tokens=prefix_tokens or 0,
                     )
                 ]
+
+        return self
+
+
+class DistributionDatasetConfig(DataConfig):
+    """
+    Configuration for distribution-based dataset that samples token lengths
+    from categorical distributions.
+    """
+
+    prompt_tokens: list[int] = Field(
+        description="List of prompt token values to sample from",
+        min_length=1,
+    )
+    prompt_probs: list[float] = Field(
+        description="Probabilities for each prompt token value (will be normalized)",
+        min_length=1,
+    )
+    output_tokens: list[int] = Field(
+        description="List of output token values to sample from",
+        min_length=1,
+    )
+    output_probs: list[float] = Field(
+        description="Probabilities for each output token value (will be normalized)",
+        min_length=1,
+    )
+
+    @model_validator(mode="after")
+    def validate_distribution_config(self) -> DistributionDatasetConfig:
+        """
+        Validate that token lists and probability lists match lengths,
+        and that probabilities are non-negative.
+        """
+        if len(self.prompt_tokens) != len(self.prompt_probs):
+            raise ValueError(
+                f"prompt_tokens and prompt_probs must have the same length, "
+                f"got {len(self.prompt_tokens)} and {len(self.prompt_probs)}"
+            )
+
+        if len(self.output_tokens) != len(self.output_probs):
+            raise ValueError(
+                f"output_tokens and output_probs must have the same length, "
+                f"got {len(self.output_tokens)} and {len(self.output_probs)}"
+            )
+
+        if any(p < 0 for p in self.prompt_probs):
+            raise ValueError("prompt_probs must contain non-negative values")
+
+        if any(p < 0 for p in self.output_probs):
+            raise ValueError("output_probs must contain non-negative values")
+
+        # Normalize probabilities (they will be normalized at sampling time)
+        # but we validate they're not all zero
+        if sum(self.prompt_probs) == 0:
+            raise ValueError("prompt_probs must contain at least one positive value")
+
+        if sum(self.output_probs) == 0:
+            raise ValueError("output_probs must contain at least one positive value")
 
         return self

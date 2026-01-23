@@ -3,7 +3,7 @@ import re
 from pathlib import Path
 
 from packaging.version import Version
-from setuptools import setup
+from setuptools import setup, Extension
 from setuptools_git_versioning import count_since, get_branch, get_sha, get_tags
 
 LAST_RELEASE_VERSION = Version("0.4.0")
@@ -119,7 +119,18 @@ def write_version_files() -> tuple[Path, Path]:
     return version_txt_path, version_py_path
 
 
+# C extension modules
+ext_modules = [
+    Extension(
+        "guidellm_c_api",
+        sources=["src/guidellm/c_api/guidellm_c_api.c"],
+        include_dirs=["include"],
+        language="c",
+    ),
+]
+
 setup(
+    ext_modules=ext_modules,
     setuptools_git_versioning={
         "enabled": True,
         "version_file": str(write_version_files()[0]),

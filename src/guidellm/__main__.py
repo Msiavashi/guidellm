@@ -132,7 +132,10 @@ def benchmark():
     multiple=True,
     help=(
         "HuggingFace dataset ID, path to dataset, path to data file "
-        "(csv/json/jsonl/txt), or synthetic data config (json/key=value)."
+        "(csv/json/jsonl/txt), synthetic data config (json/key=value), "
+        "or distribution URI (dist://prompt_tokens=[...];prompt_probs=[...];...). "
+        "Examples: 'prompt_tokens=256,output_tokens=128' or "
+        "'dist://prompt_tokens=[32,128,512];prompt_probs=[0.4,0.4,0.2];output_tokens=[32,128];output_probs=[0.6,0.4]'"
     ),
 )
 @click.option(
@@ -152,6 +155,27 @@ def benchmark():
         "Benchmark rate(s) to test. Meaning depends on profile: "
         "sweep=number of benchmarks, concurrent=concurrent requests, "
         "async/constant/poisson=requests per second."
+    ),
+)
+@click.option(
+    "--phases",
+    type=str,
+    default=None,
+    help=(
+        "Phase specification for bursty profile. "
+        "Format: '<model>:<rate>@<duration>,<model>:<rate>@<duration>,...' "
+        "where model is 'constant' or 'poisson', rate is req/s, "
+        "and duration supports ms/s/m units. "
+        "Example: 'constant:50@5s,constant:2@5s' or 'poisson:20@60s,poisson:40@60s'"
+    ),
+)
+@click.option(
+    "--repeat",
+    type=int,
+    default=1,
+    help=(
+        "Number of times to repeat the phase sequence (for bursty profile). "
+        "Example: --repeat 30 repeats the phases 30 times."
     ),
 )
 # Backend configuration

@@ -3,6 +3,10 @@ from .deserializer import (
     DatasetDeserializer,
     DatasetDeserializerFactory,
 )
+from .distribution import (
+    DistributionDataset,
+    DistributionDatasetDeserializer,
+)
 from .file import (
     ArrowFileDatasetDeserializer,
     CSVFileDatasetDeserializer,
@@ -33,6 +37,8 @@ __all__ = [
     "DataNotSupportedError",
     "DatasetDeserializer",
     "DatasetDeserializerFactory",
+    "DistributionDataset",
+    "DistributionDatasetDeserializer",
     "HDF5FileDatasetDeserializer",
     "HuggingFaceDatasetDeserializer",
     "InMemoryCsvDatasetDeserializer",

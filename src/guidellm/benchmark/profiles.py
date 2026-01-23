@@ -30,6 +30,7 @@ from guidellm import settings
 from guidellm.scheduler import (
     AsyncConstantStrategy,
     AsyncPoissonStrategy,
+    BurstyStrategy,
     ConcurrentStrategy,
     Constraint,
     ConstraintInitializer,
@@ -45,6 +46,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AsyncProfile",
+    "BurstyProfile",
     "ConcurrentProfile",
     "Profile",
     "ProfileType",
@@ -54,7 +56,7 @@ __all__ = [
 ]
 
 ProfileType = Annotated[
-    Literal["synchronous", "concurrent", "throughput", "async", "sweep"],
+    Literal["synchronous", "concurrent", "throughput", "async", "sweep", "bursty"],
     "Profile type identifiers for polymorphic deserialization",
 ]
 
@@ -716,3 +718,230 @@ class SweepProfile(Profile):
             )
         else:
             raise ValueError(f"Invalid strategy type: {self.strategy_type}")
+
+
+def parse_duration(duration_str: str) -> float:
+    """
+    Parse duration string with unit suffix to seconds.
+
+    Supports: ms (milliseconds), s (seconds), m (minutes)
+
+    :param duration_str: Duration string (e.g., "5s", "100ms", "2m")
+    :return: Duration in seconds
+    :raises ValueError: If format is invalid
+    """
+    duration_str = duration_str.strip().lower()
+
+    if duration_str.endswith("ms"):
+        return float(duration_str[:-2]) / 1000.0
+    elif duration_str.endswith("s"):
+        return float(duration_str[:-1])
+    elif duration_str.endswith("m"):
+        return float(duration_str[:-1]) * 60.0
+    else:
+        # Try to parse as plain number (assume seconds)
+        try:
+            return float(duration_str)
+        except ValueError as e:
+            raise ValueError(
+                f"Invalid duration format: {duration_str}. "
+                "Expected format: <number><unit> where unit is ms, s, or m"
+            ) from e
+
+
+def parse_phases(phases_str: str) -> list[dict[str, Any]]:
+    """
+    Parse phases string into list of phase configurations.
+
+    Format: "constant:50@5s,poisson:20@10s"
+    Each phase: <model>:<rate>@<duration>
+
+    :param phases_str: Comma-separated list of phase specifications
+    :return: List of phase config dictionaries with keys: model, rate, duration
+    :raises ValueError: If format is invalid
+    """
+    phases = []
+    phase_parts = phases_str.split(",")
+
+    for phase_part in phase_parts:
+        phase_part = phase_part.strip()
+        if not phase_part:
+            continue
+
+        # Parse format: model:rate@duration
+        if "@" not in phase_part:
+            raise ValueError(f"Invalid phase format: {phase_part}. Expected format: <model>:<rate>@<duration>")
+
+        rate_part, duration_part = phase_part.rsplit("@", 1)
+        if ":" not in rate_part:
+            raise ValueError(f"Invalid phase format: {phase_part}. Expected format: <model>:<rate>@<duration>")
+
+        model, rate_str = rate_part.split(":", 1)
+
+        model = model.strip().lower()
+        if model not in ["constant", "poisson"]:
+            raise ValueError(f"Invalid model type: {model}. Must be 'constant' or 'poisson'")
+
+        try:
+            rate = float(rate_str.strip())
+            if rate <= 0:
+                raise ValueError(f"Rate must be positive, got: {rate}")
+        except ValueError as e:
+            raise ValueError(f"Invalid rate value: {rate_str}") from e
+
+        try:
+            duration = parse_duration(duration_part.strip())
+            if duration <= 0:
+                raise ValueError(f"Duration must be positive, got: {duration}")
+        except ValueError as e:
+            raise ValueError(f"Invalid duration: {duration_part}") from e
+
+        phases.append({
+            "model": model,
+            "rate": rate,
+            "duration": duration,
+        })
+
+    if not phases:
+        raise ValueError("At least one phase must be specified")
+
+    return phases
+
+
+@Profile.register("bursty")
+class BurstyProfile(Profile):
+    """
+    Generate time-varying request rates through configurable phases.
+
+    Executes a sequence of phases, each with a specific rate (constant or poisson)
+    and duration. Phases can repeat multiple times to create bursty workload patterns.
+    Each phase becomes a separate strategy with time-based constraints.
+    """
+
+    type_: Literal["bursty"] = "bursty"  # type: ignore[assignment]
+    phases: list[dict[str, Any]] = Field(
+        description="List of phase configurations with model, rate, and duration",
+    )
+    repeat: PositiveInt = Field(
+        default=1,
+        description="Number of times to repeat the phase sequence",
+    )
+    max_concurrency: PositiveInt | None = Field(
+        default=None,
+        description="Maximum concurrent requests to schedule (global across all phases)",
+    )
+    random_seed: int = Field(
+        default=42,
+        description="Random seed for Poisson distribution phases",
+    )
+
+    @classmethod
+    def resolve_args(
+        cls,
+        rate_type: str,
+        rate: list[float] | None,
+        random_seed: int,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """
+        Resolve arguments for bursty profile construction.
+
+        :param rate_type: Profile type identifier (must be "bursty")
+        :param rate: Rate parameter (unused for bursty profile)
+        :param random_seed: Seed for stochastic strategies
+        :param kwargs: Additional arguments including 'phases' and 'repeat'
+        :return: Resolved arguments dictionary
+        :raises ValueError: If phases is not provided or invalid
+        """
+        _ = rate  # unused for bursty profile
+
+        if rate_type != "bursty":
+            raise ValueError(f"BurstyProfile requires rate_type='bursty', got: {rate_type}")
+
+        phases_str = kwargs.get("phases")
+        if phases_str is None:
+            raise ValueError("BurstyProfile requires a 'phases' parameter")
+
+        if isinstance(phases_str, str):
+            phases = parse_phases(phases_str)
+        elif isinstance(phases_str, list):
+            phases = phases_str
+        else:
+            raise ValueError(f"Invalid phases type: {type(phases_str)}. Expected str or list")
+
+        kwargs["phases"] = phases
+        kwargs["random_seed"] = random_seed
+        kwargs["type_"] = "bursty"
+
+        return kwargs
+
+    @property
+    def strategy_types(self) -> list[str]:
+        """
+        :return: Single bursty strategy type
+        """
+        return ["bursty"]
+
+    def next_strategy(
+        self,
+        prev_strategy: SchedulingStrategy | None,
+        prev_benchmark: Benchmark | None,
+    ) -> BurstyStrategy | None:
+        """
+        Generate single bursty strategy that handles all phases.
+
+        :param prev_strategy: Previously completed strategy (unused)
+        :param prev_benchmark: Benchmark results from previous execution (unused)
+        :return: BurstyStrategy for all phases, or None if already completed
+        """
+        _ = (prev_strategy, prev_benchmark)  # unused
+
+        if len(self.completed_strategies) >= 1:
+            return None
+
+        # Create single bursty strategy that handles all phases
+        return BurstyStrategy(
+            phases=self.phases,
+            repeat=self.repeat,
+            max_concurrency=self.max_concurrency,
+            random_seed=self.random_seed,
+        )
+
+    def next_strategy_constraints(
+        self,
+        next_strategy: SchedulingStrategy | None,
+        prev_strategy: SchedulingStrategy | None,
+        prev_benchmark: Benchmark | None,
+    ) -> dict[str, Constraint] | None:
+        """
+        Generate constraints for bursty strategy execution.
+
+        Sets max_seconds based on total phase duration if not already set.
+
+        :param next_strategy: Strategy to be executed next
+        :param prev_strategy: Previously completed strategy instance
+        :param prev_benchmark: Benchmark results from previous execution (unused)
+        :return: Constraints dictionary with max_seconds, or None
+        """
+        _ = (prev_strategy, prev_benchmark)  # unused
+
+        if next_strategy is None:
+            return None
+
+        # Calculate total duration
+        phase_duration = sum(phase["duration"] for phase in self.phases)
+        total_duration = phase_duration * self.repeat
+
+        # Start with global constraints if provided
+        constraints = {}
+        if self.constraints:
+            global_constraints = ConstraintsInitializerFactory.resolve(self.constraints)
+            constraints.update(global_constraints)
+
+        # Set max_seconds if not already set (or use the calculated total)
+        if "max_seconds" not in constraints:
+            constraints["max_seconds"] = ConstraintsInitializerFactory.create_constraint(
+                "max_seconds", max_duration=total_duration
+            )
+
+        return constraints

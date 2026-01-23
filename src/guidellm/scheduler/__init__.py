@@ -41,6 +41,7 @@ from .schemas import (
 from .strategies import (
     AsyncConstantStrategy,
     AsyncPoissonStrategy,
+    BurstyStrategy,
     ConcurrentStrategy,
     SchedulingStrategy,
     StrategyT,
@@ -55,6 +56,7 @@ __all__ = [
     "AsyncConstantStrategy",
     "AsyncPoissonStrategy",
     "BackendInterface",
+    "BurstyStrategy",
     "BackendT",
     "ConcurrentStrategy",
     "Constraint",

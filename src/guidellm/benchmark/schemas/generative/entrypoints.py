@@ -172,6 +172,13 @@ class BenchmarkGenerativeTextArgs(StandardBaseModel):
     rate: list[float] | None = Field(
         default=None, description="Request rate(s) for rate-based scheduling"
     )
+    phases: str | None = Field(
+        default=None,
+        description="Phase specification for bursty profile (format: 'constant:50@5s,poisson:20@10s')",
+    )
+    repeat: int = Field(
+        default=1, description="Number of times to repeat the phase sequence (for bursty profile)"
+    )
     # Backend configuration
     backend: BackendType | Backend = Field(
         default="openai_http", description="Backend type or instance for execution"

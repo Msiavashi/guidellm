@@ -35,7 +35,7 @@ from guidellm.benchmark.schemas import (
     GenerativeBenchmark,
     GenerativeBenchmarkAccumulator,
 )
-from guidellm.scheduler import SchedulerState, SchedulingStrategy
+from guidellm.scheduler import BurstyStrategy, SchedulerState, SchedulingStrategy
 from guidellm.utils import Colors, format_value_display, safe_format_timestamp
 
 __all__ = ["BenchmarkerProgress", "GenerativeConsoleBenchmarkerProgress"]
@@ -313,9 +313,14 @@ class _GenerativeProgressTasks(Progress):
         current_state = self.benchmark_task_states[self.current_index]
         current_state.update(accumulator, scheduler_state)
         if current_state.task_id is not None:
+            # Update description dynamically for bursty strategies
+            current_dict = current_state.current
+            if isinstance(current_state.strategy, BurstyStrategy):
+                # Use get_phase_info() method for more reliable phase info
+                current_dict["description"] = current_state.strategy.get_phase_info()
             self.update(
                 current_state.task_id,
-                **current_state.current,
+                **current_dict,
             )
 
     def complete_benchmark(self, benchmark: GenerativeBenchmark):
@@ -359,9 +364,15 @@ class _GenerativeProgressTaskState:
 
     @property
     def current(self) -> dict[str, Any]:
+        # For bursty strategies, update description dynamically with phase info
+        description = str(self.strategy or self.strategy_type)
+        if isinstance(self.strategy, BurstyStrategy):
+            # Use get_phase_info() for more reliable phase info
+            description = self.strategy.get_phase_info()
+        
         return {
             "start_time": self.formatted_start_time,
-            "description": str(self.strategy or self.strategy_type),
+            "description": description,
             "progress_status": self.formatted_progress_status,
             "requests_summary": self.formatted_requests_summary,
             "tokens_summary": self.formatted_tokens_summary,
