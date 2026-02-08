@@ -11,7 +11,11 @@ from torch.utils.data.dataset import IterableDataset as TorchIterableDataset
 from transformers import PreTrainedTokenizerBase
 
 from guidellm.data.deserializers import DatasetDeserializerFactory
-from guidellm.data.preprocessors import DataDependentPreprocessor, DatasetPreprocessor
+from guidellm.data.preprocessors import (
+    DataDependentPreprocessor,
+    DatasetPreprocessor,
+    SkipDataRow,
+)
 from guidellm.logger import logger
 from guidellm.utils import InfoMixin
 
@@ -121,6 +125,9 @@ class DatasetsIterator(TorchIterableDataset[DataT]):
                     yield row  # type: ignore[misc]
                 except StopIteration:
                     raise  # Stop iteration when any dataset is exhausted
+                except SkipDataRow:
+                    gen_count -= 1
+                    continue
                 except Exception as err:  # noqa: BLE001 # Exception logged
                     logger.error(f"Skipping data row due to error: {err}")
                     gen_count -= 1

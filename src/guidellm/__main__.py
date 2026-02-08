@@ -178,6 +178,39 @@ def benchmark():
         "Example: --repeat 30 repeats the phases 30 times."
     ),
 )
+@click.option(
+    "--delay",
+    multiple=True,
+    callback=cli_tools.parse_list_floats,
+    default=BenchmarkGenerativeTextArgs.get_default("delay"),
+    help=(
+        "Delay in seconds before executing each benchmark run (each rate). "
+        "Can specify multiple delays to match each rate positionally. "
+        "If fewer delays than rates, uses 0 for remaining. "
+        "If one delay, applies to all rates uniformly. "
+        "Example: --rate 1 --rate 8 --rate 16 --delay 0 --delay 10 --delay 30"
+    ),
+)
+@click.option(
+    "--restart-backend-between-runs",
+    is_flag=True,
+    default=False,
+    help=(
+        "Restart the backend (close and reopen connections) between each benchmark run. "
+        "Use this when the server becomes unresponsive across multiple high-rate runs. "
+        "Ensures fresh connections for each rate benchmark."
+    ),
+)
+@click.option(
+    "--pause-for-enter",
+    is_flag=True,
+    default=False,
+    help=(
+        "Pause and wait for Enter key press before running each benchmark (each rate). "
+        "Useful for manual inspection, server adjustment, or coordination between runs. "
+        "Press Enter to continue to the next rate."
+    ),
+)
 # Backend configuration
 @click.option(
     "--backend",
@@ -255,6 +288,74 @@ def benchmark():
     help="JSON string of column mappings to apply to the dataset.",
 )
 @click.option(
+    "--compute-output-tokens-from-response",
+    is_flag=True,
+    default=False,
+    help="Compute output token counts from response text in the dataset instead of using pre-computed counts.",
+)
+@click.option(
+    "--token-budget-total",
+    type=int,
+    default=None,
+    help=(
+        "Filter dataset rows to those where input_tokens + output_tokens equals this value."
+    ),
+)
+@click.option(
+    "--max-input-length",
+    type=int,
+    default=None,
+    help=(
+        "Filter dataset rows to those where input tokens are less than or equal to this value."
+    ),
+)
+@click.option(
+    "--max-output-length",
+    type=int,
+    default=None,
+    help=(
+        "Filter dataset rows to those where output tokens are less than or equal to this value."
+    ),
+)
+@click.option(
+    "--use-filter-cache/--no-filter-cache",
+    default=True,
+    help="Enable or disable caching of filtered datasets to speed up repeated runs with the same filters.",
+)
+@click.option(
+    "--input-length-stats",
+    is_flag=True,
+    default=False,
+    help="Print input length distribution (mean, p25, p50, p75, p95) for the dataset.",
+)
+@click.option(
+    "--sharegpt-format",
+    type=click.Choice(["conversational", "tokenized"]),
+    default=None,
+    help="Process ShareGPT-style datasets. Use 'conversational' for raw conversation JSON, 'tokenized' for pre-tokenized datasets like openchat/openchat_sharegpt_v3.",
+)
+@click.option(
+    "--sharegpt-conversations-column",
+    default="conversations",
+    help="Column name containing the conversations in ShareGPT format.",
+)
+@click.option(
+    "--sharegpt-human-role",
+    default="human",
+    help="Role identifier for human messages in ShareGPT conversations (e.g., 'human', 'user').",
+)
+@click.option(
+    "--sharegpt-assistant-role",
+    default="gpt",
+    help="Role identifier for assistant messages in ShareGPT conversations (e.g., 'gpt', 'assistant').",
+)
+@click.option(
+    "--sharegpt-use-last-turn",
+    is_flag=True,
+    default=True,
+    help="Use the last conversation turn for prompt/response extraction (default). Use --no-sharegpt-use-last-turn for first turn.",
+)
+@click.option(
     "--data-sampler",
     default=BenchmarkGenerativeTextArgs.get_default("data_sampler"),
     type=click.Choice(["shuffle"]),
@@ -303,6 +404,17 @@ def benchmark():
     help=(
         "Legacy parameter for the output path to save the output result to. "
         "Resolves to fill in output-dir and outputs based on input path."
+    ),
+)
+@click.option(
+    "--update",
+    is_flag=True,
+    default=False,
+    help=(
+        "Update existing benchmark results instead of overwriting. "
+        "Loads existing benchmarks.json and replaces only the benchmarks "
+        "with matching rates, preserving other results. "
+        "Useful for re-running specific rates in a sweep."
     ),
 )
 @click.option(
@@ -435,14 +547,68 @@ def run(**kwargs):  # noqa: C901
     # Handle remapping for request params
     request_type = kwargs.pop("request_type", None)
     request_formatter_kwargs = kwargs.pop("request_formatter_kwargs", None)
+    compute_output_tokens_from_response = kwargs.pop("compute_output_tokens_from_response", False)
+    
+    # Handle ShareGPT parameters
+    sharegpt_format = kwargs.pop("sharegpt_format", None)
+    sharegpt_conversations_column = kwargs.pop("sharegpt_conversations_column", "conversations")
+    sharegpt_human_role = kwargs.pop("sharegpt_human_role", "human")
+    sharegpt_assistant_role = kwargs.pop("sharegpt_assistant_role", "gpt")
+    sharegpt_use_last_turn = kwargs.pop("sharegpt_use_last_turn", True)
+    
+    # Build formatter kwargs with the new flag
+    formatter_kwargs = {}
+    if request_formatter_kwargs:
+        formatter_kwargs.update(request_formatter_kwargs)
+    if compute_output_tokens_from_response:
+        formatter_kwargs["compute_output_tokens_from_response"] = True
+
+    token_budget_total = kwargs.pop("token_budget_total", None)
+    max_input_length = kwargs.pop("max_input_length", None)
+    max_output_length = kwargs.pop("max_output_length", None)
+    use_filter_cache = kwargs.pop("use_filter_cache", True)
+    input_length_stats = kwargs.pop("input_length_stats", False)
+    
+    # Validate that conflicting filters aren't used together
+    if token_budget_total is not None and (max_input_length is not None or max_output_length is not None):
+        raise click.BadParameter(
+            "Cannot use --token-budget-total together with --max-input-length or --max-output-length. "
+            "Use either the total budget or separate length limits."
+        )
+    
+    # Add ShareGPT preprocessing configuration
+    if sharegpt_format == "conversational":
+        kwargs["sharegpt_preprocessor"] = {
+            "type": "conversational",
+            "conversations_column": sharegpt_conversations_column,
+            "human_role": sharegpt_human_role,
+            "assistant_role": sharegpt_assistant_role,
+            "use_last_turn": sharegpt_use_last_turn,
+        }
+    elif sharegpt_format == "tokenized":
+        kwargs["sharegpt_preprocessor"] = {
+            "type": "tokenized",
+            "use_last_turn": sharegpt_use_last_turn,
+        }
+
+    if token_budget_total is not None:
+        kwargs["token_budget_total"] = token_budget_total
+        kwargs["use_filter_cache"] = use_filter_cache
+    if max_input_length is not None or max_output_length is not None:
+        kwargs["max_input_length"] = max_input_length
+        kwargs["max_output_length"] = max_output_length
+        kwargs["use_filter_cache"] = use_filter_cache
+    if input_length_stats:
+        kwargs["input_length_stats"] = input_length_stats
+    
     if request_type is not None:
         kwargs["data_request_formatter"] = (
             request_type
-            if not request_formatter_kwargs
-            else {"request_type": request_type, **request_formatter_kwargs}
+            if not formatter_kwargs
+            else {"request_type": request_type, **formatter_kwargs}
         )
-    elif request_formatter_kwargs is not None:
-        kwargs["data_request_formatter"] = request_formatter_kwargs
+    elif formatter_kwargs:
+        kwargs["data_request_formatter"] = formatter_kwargs
 
     # Handle output path remapping
     if (output_path := kwargs.pop("output_path", None)) is not None:

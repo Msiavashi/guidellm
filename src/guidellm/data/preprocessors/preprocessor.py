@@ -7,7 +7,16 @@ from datasets import Dataset, IterableDataset
 from guidellm.schemas import GenerationRequest
 from guidellm.utils import RegistryMixin
 
-__all__ = ["DataDependentPreprocessor", "DatasetPreprocessor", "PreprocessorRegistry"]
+__all__ = [
+    "DataDependentPreprocessor",
+    "DatasetPreprocessor",
+    "PreprocessorRegistry",
+    "SkipDataRow",
+]
+
+
+class SkipDataRow(Exception):
+    """Signal that a dataset row should be skipped without logging an error."""
 
 
 @runtime_checkable

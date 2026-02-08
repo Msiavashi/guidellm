@@ -38,6 +38,15 @@ class GenerativeColumnMapper(DataDependentPreprocessor):
             "turn",
             "text",
         ],
+        "response_column": [
+            "response",
+            "reply",
+            "output",
+            "completion",
+            "answer",
+            "assistant",
+            "gpt",
+        ],
         "image_column": [
             "image",
             "picture",
@@ -180,6 +189,35 @@ class GenerativeColumnMapper(DataDependentPreprocessor):
                 dataset_column,
             ) in column_mappings:
                 mapped[column_type].append(items[dataset_index][dataset_column])
+
+        # Check for dynamically added fields from prior preprocessors (e.g., ShareGPTPreprocessor)
+        # These fields might be added directly to the dataset row by other preprocessors.
+        # If the mapped values are non-strings (like a list of dicts), prefer dynamic fields.
+        dynamic_field_mappings = {
+            "text_column": ["prompt", "text"],
+            "response_column": ["response", "reply", "output"],
+        }
+
+        def _has_non_string_values(values: list[Any]) -> bool:
+            return any(value is not None and not isinstance(value, str) for value in values)
+
+        for column_type, field_names in dynamic_field_mappings.items():
+            mapped_values = mapped.get(column_type, [])
+            if not mapped_values or _has_non_string_values(mapped_values):
+                # Check each dataset row for dynamically added fields
+                # items can be either a list or dict-like with integer keys
+                items_iter = items.items() if hasattr(items, "items") else enumerate(items)
+                dynamic_values: list[str] = []
+                for _, dataset_row in items_iter:
+                    if not isinstance(dataset_row, dict):
+                        continue
+                    for field_name in field_names:
+                        value = dataset_row.get(field_name)
+                        if isinstance(value, str) and value:
+                            dynamic_values.append(value)
+                            break
+                if dynamic_values:
+                    mapped[column_type] = dynamic_values
 
         return dict(mapped)
 

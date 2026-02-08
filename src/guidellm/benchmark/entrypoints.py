@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from torch.utils.data import Sampler
+from datasets import Dataset, IterableDataset
 from transformers import PreTrainedTokenizerBase
 from typing_extensions import TypeAliasType
 
@@ -42,13 +43,22 @@ from guidellm.data import (
     ProcessorFactory,
     RequestFormatter,
 )
+from guidellm.data.loaders import DatasetsIterator
+from guidellm.data.preprocessors.preprocessor import DataDependentPreprocessor
 from guidellm.data.preprocessors import GenerativeColumnMapper
+from guidellm.data.deserializers import DatasetDeserializerFactory
+from guidellm.data.preprocessors.token_budget import (
+    compute_input_tokens,
+    compute_output_tokens,
+)
+from guidellm.data.cache import DatasetFilterCache
 from guidellm.scheduler import (
     ConstraintInitializer,
     NonDistributedEnvironment,
     StrategyType,
 )
 from guidellm.schemas import GenerationRequest, GenerationResponse
+from guidellm.schemas.statistics import DistributionSummary
 from guidellm.settings import settings
 from guidellm.utils import Console, InfoMixin
 
@@ -195,6 +205,12 @@ async def resolve_request_loader(
     data_sampler: Sampler[int] | Literal["shuffle"] | None,
     data_num_workers: int | None,
     random_seed: int,
+    sharegpt_preprocessor: dict[str, Any] | None = None,
+    token_budget_total: int | None = None,
+    max_input_length: int | None = None,
+    max_output_length: int | None = None,
+    use_filter_cache: bool = True,
+    input_length_stats: bool = False,
     console: Console | None = None,
     **dataloader_kwargs: dict[str, Any] | None,
 ) -> DataLoader[GenerationRequest]:
@@ -243,6 +259,7 @@ async def resolve_request_loader(
             column_mappings=column_mappings  # type: ignore[arg-type]
         )
 
+    processor_factory = None
     data_request_formatter_instance: RequestFormatter
     if isinstance(data_request_formatter, RequestFormatter):
         data_request_formatter_instance = data_request_formatter
@@ -269,25 +286,317 @@ async def resolve_request_loader(
                 f"RequestFormatter."
             )
 
+        # Create processor factory for the formatter
+        processor_factory = ProcessorFactory(
+            processor=processor if processor is not None else model,
+            processor_args=processor_args,
+        )
+
         data_request_formatter_instance = formatter_class(
             model=model,
+            processor_factory=processor_factory,
             **formatter_kwargs,
         )
 
-    # Cast to proper types for the DataLoader preprocessors list
-    preprocessors_list: list[DatasetPreprocessor] = [
-        data_column_mapper_instance,
-        data_request_formatter_instance,
-    ]
+    if processor_factory is None:
+        processor_factory = ProcessorFactory(
+            processor=processor if processor is not None else model,
+            processor_args=processor_args,
+        )
+
+    # Build preprocessors list
+    preprocessors_list: list[DatasetPreprocessor] = []
+
+    # Add ShareGPT preprocessor if configured (must come first to transform conversational data)
+    sharegpt_instance: DatasetPreprocessor | None = None
+    if sharegpt_preprocessor:
+        preprocessor_type = sharegpt_preprocessor.get("type", "conversational")
+
+        if preprocessor_type == "conversational":
+            from guidellm.data.preprocessors.sharegpt import ShareGPTPreprocessor
+
+            sharegpt_config = {
+                k: v for k, v in sharegpt_preprocessor.items() if k != "type"
+            }
+            sharegpt_instance = ShareGPTPreprocessor(**sharegpt_config)
+            preprocessors_list.append(sharegpt_instance)
+        elif preprocessor_type == "tokenized":
+            from guidellm.data.preprocessors.tokenized_sharegpt import (
+                TokenizedShareGPTPreprocessor,
+            )
+
+            sharegpt_config = {
+                k: v for k, v in sharegpt_preprocessor.items() if k != "type"
+            }
+            sharegpt_instance = TokenizedShareGPTPreprocessor(
+                processor_factory=processor_factory,
+                **sharegpt_config,
+            )
+            preprocessors_list.append(sharegpt_instance)
+
+    # Optional token budget/length prefilter BEFORE workload generation
+    prefiltered_lengths: list[int] | None = None
+    has_filtering = (
+        token_budget_total is not None
+        or max_input_length is not None
+        or max_output_length is not None
+    )
+    
+    if has_filtering:
+        # Initialize cache if requested (supports all filtering methods)
+        cache: DatasetFilterCache | None = None
+        cached_data: list[list[dict[str, Any]]] | None = None
+        
+        # Normalize data_args early to ensure consistent cache keys
+        if not data_args:
+            data_args = [{} for _ in data]
+        
+        filter_params = {
+            "max_input_length": max_input_length,
+            "max_output_length": max_output_length,
+            "token_budget_total": token_budget_total,
+            "random_seed": random_seed,
+            "data_samples": data_samples,
+        }
+        processor_name = str(processor) if processor is not None else model
+        
+        if use_filter_cache:
+            cache = DatasetFilterCache()
+            
+            # Try to load from cache
+            try:
+                cached_data = cache.get(
+                    data_sources=data,
+                    filter_params=filter_params,
+                    data_args=data_args,
+                    processor_name=processor_name,
+                )
+                if console and cached_data is not None:
+                    console.print_update(
+                        title="Loaded filtered dataset from cache",
+                        status="success",
+                    )
+            except Exception as e:
+                if console:
+                    console.print_update(
+                        title=f"Cache load failed: {e}",
+                        status="warning",
+                    )
+                cached_data = None
+        
+        # If we don't have cached data, perform filtering
+        if cache is None or cached_data is None:
+            datasets = []
+            for datum, data_kwargs in zip(data, data_args, strict=False):
+                datasets.append(
+                    DatasetDeserializerFactory.deserialize(
+                        data=datum,
+                        processor_factory=processor_factory,
+                        random_seed=random_seed,
+                        **data_kwargs,
+                    )
+                )
+
+            if any(isinstance(dataset, IterableDataset) for dataset in datasets) and (
+                data_samples is None or data_samples <= 0
+            ):
+                raise ValueError(
+                    "Token length filtering on iterable datasets requires a finite "
+                    "`data_samples` value to avoid infinite prefiltering."
+                )
+
+            if isinstance(data_column_mapper_instance, DataDependentPreprocessor):
+                data_column_mapper_instance.setup_data(
+                    datasets=datasets,
+                    data_args=data_args,
+                )
+
+            if console:
+                console.print_update(
+                    title=f"Filtering dataset with constraints: "
+                          f"max_input={max_input_length or 'none'}, "
+                          f"max_output={max_output_length or 'none'}, "
+                          f"total_budget={token_budget_total or 'none'}",
+                    status="info",
+                )
+
+            filtered_data: list[list[dict[str, Any]]] = [
+                [] for _ in range(len(datasets))
+            ]
+            prefiltered_lengths = []
+            dataset_iters = [iter(dataset) for dataset in datasets]
+            filtered_count = 0
+            max_filtered = data_samples if data_samples and data_samples > 0 else None
+
+            while True:
+                try:
+                    items = [next(dataset_iter) for dataset_iter in dataset_iters]
+                except StopIteration:
+                    break
+
+                if max_filtered is not None and filtered_count >= max_filtered:
+                    break
+
+                mapping_items = []
+                for item in items:
+                    if not isinstance(item, dict):
+                        raise ValueError(
+                            "Token length filtering requires dict-like dataset rows. "
+                            f"Got {type(item)} instead."
+                        )
+                    mapping_items.append(dict(item))
+                mapping_row = {"items": mapping_items}
+
+                if sharegpt_instance is not None:
+                    mapping_row = sharegpt_instance(mapping_row)  # type: ignore[assignment]
+
+                mapped = data_column_mapper_instance({"items": mapping_row["items"]})
+
+                input_tokens = compute_input_tokens(
+                    mapped,
+                    processor_factory=processor_factory,
+                    include_prefix_in_input=True,
+                )
+                output_tokens = compute_output_tokens(
+                    mapped,
+                    processor_factory=processor_factory,
+                )
+
+                if input_tokens is None or output_tokens is None:
+                    continue
+
+                # Apply filtering criteria
+                passes_filter = True
+                
+                # Check token budget total if specified
+                if token_budget_total is not None:
+                    if input_tokens + output_tokens > token_budget_total:
+                        passes_filter = False
+                
+                # Check max input length if specified
+                if max_input_length is not None:
+                    if input_tokens > max_input_length:
+                        passes_filter = False
+                
+                # Check max output length if specified
+                if max_output_length is not None:
+                    if output_tokens > max_output_length:
+                        passes_filter = False
+
+                if passes_filter:
+                    for index, item in enumerate(items):
+                        filtered_data[index].append(item)
+                    filtered_count += 1
+                    prefiltered_lengths.append(input_tokens)
+
+            for index, rows in enumerate(filtered_data):
+                if not rows:
+                    raise ValueError(
+                        f"Token length filtering produced no rows for dataset index "
+                        f"{index}. Try relaxing the filter constraints."
+                    )
+
+            if console:
+                console.print_update(
+                    title=f"Filtered {filtered_count} samples from dataset",
+                    status="success",
+                )
+
+            # Cache the filtered data if caching is enabled
+            if cache is not None and cached_data is None:
+                try:
+                    cache.set(
+                        data_sources=data,
+                        filter_params=filter_params,
+                        filtered_data=filtered_data,
+                        data_args=data_args,
+                        processor_name=processor_name,
+                    )
+                    if console:
+                        console.print_update(
+                            title="Saved filtered dataset to cache",
+                            status="success",
+                        )
+                except Exception as e:
+                    if console:
+                        console.print_update(
+                            title=f"Cache save failed: {e}",
+                            status="warning",
+                        )
+
+            cached_data = filtered_data
+
+        # Use the cached or newly filtered data
+        data = [Dataset.from_list(rows) for rows in cached_data]
+        data_args = [{} for _ in data]
+
+    # Add column mapper
+    preprocessors_list.append(data_column_mapper_instance)
+
+    # Optional input length stats AFTER filtering, BEFORE formatting
+    if input_length_stats:
+        lengths = prefiltered_lengths
+        if lengths is None:
+            stats_iterator = DatasetsIterator(
+                data=data,
+                data_args=data_args,
+                data_samples=data_samples,
+                processor_factory=processor_factory,
+                preprocessors=preprocessors_list,
+                random_seed=random_seed,
+            )
+            lengths = []
+            max_items = data_samples if data_samples and data_samples > 0 else None
+            for row in stats_iterator.generator(max_items=max_items):
+                input_tokens = compute_input_tokens(
+                    row,
+                    processor_factory=processor_factory,
+                    include_prefix_in_input=True,
+                )
+                if input_tokens is not None:
+                    lengths.append(input_tokens)
+
+        if console and lengths:
+            stats = DistributionSummary.from_values(lengths)
+            headers = ["metric", "value"]
+            values = [
+                [
+                    "count",
+                    "mean",
+                    "std_dev",
+                    "min",
+                    "p25",
+                    "p50",
+                    "p75",
+                    "p95",
+                    "max",
+                ],
+                [
+                    f"{stats.count}",
+                    f"{stats.mean:.2f}",
+                    f"{stats.std_dev:.2f}",
+                    f"{stats.min:.2f}",
+                    f"{stats.percentiles.p25:.2f}",
+                    f"{stats.percentiles.p50:.2f}",
+                    f"{stats.percentiles.p75:.2f}",
+                    f"{stats.percentiles.p95:.2f}",
+                    f"{stats.max:.2f}",
+                ],
+            ]
+            console.print_tables(
+                header_cols_groups=[headers],
+                value_cols_groups=[values],
+                title="Input length distribution (tokens)",
+            )
+
+    # Add request formatter
+    preprocessors_list.append(data_request_formatter_instance)
 
     request_loader: DataLoader[GenerationRequest] = DataLoader(
         data=data,
         data_args=data_args,
         data_samples=data_samples,
-        processor_factory=ProcessorFactory(
-            processor=processor if processor is not None else model,
-            processor_args=processor_args,
-        ),
+        processor_factory=processor_factory,
         preprocessors=preprocessors_list,
         collator=(
             data_collator if callable(data_collator) else GenerativeRequestCollator()
@@ -439,6 +748,80 @@ async def resolve_output_formats(
 # Main Entrypoints Functions
 
 
+def _get_benchmark_key(benchmark: GenerativeBenchmark) -> tuple[str, float | int | None]:
+    """
+    Extract identifying key from benchmark for matching.
+
+    :param benchmark: Benchmark to extract key from
+    :return: Tuple of (strategy_type, rate_or_streams) for matching
+    """
+    strategy = benchmark.config.strategy
+    strategy_type = strategy.type_
+
+    # Extract rate or streams depending on strategy type
+    if hasattr(strategy, "rate"):
+        # Async strategies (constant, poisson) have rate
+        return (strategy_type, float(strategy.rate))
+    elif hasattr(strategy, "streams"):
+        # Concurrent strategy has streams
+        return (strategy_type, int(strategy.streams))
+    else:
+        # Synchronous, throughput, bursty - use type only
+        return (strategy_type, None)
+
+
+def _merge_benchmark_reports(
+    existing_report: GenerativeBenchmarksReport,
+    new_report: GenerativeBenchmarksReport,
+    console: Console | None = None,
+) -> GenerativeBenchmarksReport:
+    """
+    Merge new benchmarks into existing report, replacing matching ones.
+
+    :param existing_report: Report loaded from file
+    :param new_report: Report with new benchmarks
+    :param console: Console for status messages
+    :return: Merged report with updated benchmarks
+    """
+    # Create dict of existing benchmarks by key
+    existing_by_key: dict[tuple[str, float | int | None], GenerativeBenchmark] = {}
+    for benchmark in existing_report.benchmarks:
+        key = _get_benchmark_key(benchmark)
+        existing_by_key[key] = benchmark
+
+    # Track what gets updated vs added
+    updated_keys: list[tuple[str, float | int | None]] = []
+    new_keys: list[tuple[str, float | int | None]] = []
+
+    # Replace matching benchmarks with new ones
+    for benchmark in new_report.benchmarks:
+        key = _get_benchmark_key(benchmark)
+        if key in existing_by_key:
+            updated_keys.append(key)
+        else:
+            new_keys.append(key)
+        existing_by_key[key] = benchmark
+
+    # Create merged report
+    merged_report = GenerativeBenchmarksReport(
+        metadata=new_report.metadata,  # Use new metadata
+        args=new_report.args,  # Use new args
+        benchmarks=list(existing_by_key.values()),
+    )
+
+    if console:
+        console.print_update(
+            title=f"Updated {len(updated_keys)} existing benchmark(s), "
+            f"added {len(new_keys)} new benchmark(s)",
+            details=(
+                f"Total benchmarks in report: {len(merged_report.benchmarks)}"
+            ),
+            status="success",
+        )
+
+    return merged_report
+
+
 async def benchmark_generative_text(
     args: BenchmarkGenerativeTextArgs,
     progress: GenerativeConsoleBenchmarkerProgress | None = None,
@@ -483,6 +866,12 @@ async def benchmark_generative_text(
         data_sampler=args.data_sampler,
         data_num_workers=args.data_num_workers,
         random_seed=args.random_seed,
+        sharegpt_preprocessor=getattr(args, 'sharegpt_preprocessor', None),
+        token_budget_total=args.token_budget_total,
+        max_input_length=getattr(args, 'max_input_length', None),
+        max_output_length=getattr(args, 'max_output_length', None),
+        use_filter_cache=getattr(args, 'use_filter_cache', True),
+        input_length_stats=args.input_length_stats,
         console=console,
         **(args.dataloader_kwargs or {}),
     )
@@ -522,6 +911,26 @@ async def benchmark_generative_text(
         outputs=args.outputs, output_dir=args.output_dir, console=console
     )
 
+    # Load existing report if update mode is enabled
+    existing_report: GenerativeBenchmarksReport | None = None
+    if args.update:
+        # Try to load existing report from output directory
+        try:
+            output_file = args.output_dir / "benchmarks.json"
+            if output_file.exists():
+                existing_report = GenerativeBenchmarksReport.load_file(output_file)
+                if console:
+                    console.print_update(
+                        title=f"Loaded existing report with {len(existing_report.benchmarks)} benchmark(s)",
+                        status="info",
+                    )
+        except Exception as e:
+            if console:
+                console.print_update(
+                    title=f"Could not load existing report: {e}. Creating new report.",
+                    status="warning",
+                )
+
     report = GenerativeBenchmarksReport(args=args)
     if console:
         console.print_update(
@@ -544,9 +953,16 @@ async def benchmark_generative_text(
         warmup=warmup,
         cooldown=cooldown,
         prefer_response_metrics=args.prefer_response_metrics,
+        delay=args.delay,
+        restart_backend_between_runs=args.restart_backend_between_runs,
+        pause_for_enter=args.pause_for_enter,
     ):
         if benchmark:
             report.benchmarks.append(benchmark)
+
+    # Merge with existing benchmarks if update mode
+    if existing_report is not None:
+        report = _merge_benchmark_reports(existing_report, report, console)
 
     output_format_results = {}
     for key, output in output_formats.items():

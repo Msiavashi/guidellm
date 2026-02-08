@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
+
+from transformers import PreTrainedTokenizerBase
 
 from guidellm.data.preprocessors.preprocessor import (
     DatasetPreprocessor,
@@ -49,6 +52,8 @@ class GenerativeTextCompletionsRequestFormatter(RequestFormatter):
         stream: bool = True,
         max_tokens: int | None = None,
         max_completion_tokens: int | None = None,
+        compute_output_tokens_from_response: bool = False,
+        processor_factory: Callable[[], PreTrainedTokenizerBase] | None = None,
     ):
         self.model: str = model
         self.extras = (
@@ -58,6 +63,8 @@ class GenerativeTextCompletionsRequestFormatter(RequestFormatter):
         )
         self.stream: bool = stream
         self.max_tokens: int | None = max_tokens or max_completion_tokens
+        self.compute_output_tokens_from_response: bool = compute_output_tokens_from_response
+        self.processor_factory: Callable[[], PreTrainedTokenizerBase] | None = processor_factory
 
     def __call__(self, columns: dict[str, list[Any]]) -> GenerationRequest:
         """
@@ -89,6 +96,29 @@ class GenerativeTextCompletionsRequestFormatter(RequestFormatter):
             arguments.body["max_tokens"] = output_tokens
             arguments.body["stop"] = None
             arguments.body["ignore_eos"] = True
+        elif self.compute_output_tokens_from_response and columns.get("response_column"):
+            # Compute output tokens from response text
+            response_texts = columns.get("response_column", [])
+            if response_texts and self.processor_factory:
+                processor = self.processor_factory()
+                total_tokens = 0
+                for response_text in response_texts:
+                    if response_text:
+                        # Handle case where response_text might be a list
+                        if isinstance(response_text, list):
+                            # Join list items if it's a list
+                            text_to_encode = " ".join(str(item) for item in response_text if item)
+                        else:
+                            text_to_encode = str(response_text)
+                        
+                        if text_to_encode:
+                            tokens = processor.encode(text_to_encode)
+                            total_tokens += len(tokens)
+                if total_tokens > 0:
+                    output_metrics.text_tokens = total_tokens
+                    arguments.body["max_tokens"] = total_tokens
+                    arguments.body["stop"] = None
+                    arguments.body["ignore_eos"] = True
         elif self.max_tokens is not None:
             arguments.body["max_tokens"] = self.max_tokens
 
@@ -103,8 +133,12 @@ class GenerativeTextCompletionsRequestFormatter(RequestFormatter):
             arguments.model_combine(self.extras)
 
         # Build prompt
-        prefix = "".join(pre for pre in columns.get("prefix_column", []) if pre)
-        text = "".join(txt for txt in columns.get("text_column", []) if txt)
+        prefix = "".join(
+            pre for pre in columns.get("prefix_column", []) if isinstance(pre, str) and pre
+        )
+        text = "".join(
+            txt for txt in columns.get("text_column", []) if isinstance(txt, str) and txt
+        )
         if prefix or text:
             prompt = prefix + text
             arguments.body["prompt"] = prompt
@@ -128,6 +162,8 @@ class GenerativeChatCompletionsRequestFormatter(RequestFormatter):
         max_tokens: int | None = None,
         max_completion_tokens: int | None = None,
         encode_kwargs: dict[str, Any] | None = None,
+        compute_output_tokens_from_response: bool = False,
+        processor_factory: Callable[[], PreTrainedTokenizerBase] | None = None,
     ):
         self.model = model
         self.extras = (
@@ -137,6 +173,8 @@ class GenerativeChatCompletionsRequestFormatter(RequestFormatter):
         )
         self.stream = stream
         self.max_completion_tokens = max_tokens or max_completion_tokens
+        self.compute_output_tokens_from_response = compute_output_tokens_from_response
+        self.processor_factory = processor_factory
         self.encode_image_kwargs = (
             encode_kwargs.get("image", {}) if encode_kwargs else {}
         )
@@ -183,6 +221,33 @@ class GenerativeChatCompletionsRequestFormatter(RequestFormatter):
                     "ignore_eos": True,
                 }
             )
+        elif self.compute_output_tokens_from_response and columns.get("response_column"):
+            # Compute output tokens from response text
+            response_texts = columns.get("response_column", [])
+            if response_texts and self.processor_factory:
+                processor = self.processor_factory()
+                total_tokens = 0
+                for response_text in response_texts:
+                    if response_text:
+                        # Handle case where response_text might be a list
+                        if isinstance(response_text, list):
+                            # Join list items if it's a list
+                            text_to_encode = " ".join(str(item) for item in response_text if item)
+                        else:
+                            text_to_encode = str(response_text)
+                        
+                        if text_to_encode:
+                            tokens = processor.encode(text_to_encode)
+                            total_tokens += len(tokens)
+                if total_tokens > 0:
+                    output_metrics.text_tokens = total_tokens
+                    arguments.body.update(
+                        {
+                            "max_completion_tokens": total_tokens,
+                            "stop": None,
+                            "ignore_eos": True,
+                        }
+                    )
         elif self.max_completion_tokens is not None:
             arguments.body["max_completion_tokens"] = self.max_completion_tokens
 
@@ -200,14 +265,14 @@ class GenerativeChatCompletionsRequestFormatter(RequestFormatter):
         arguments.body["messages"] = []
 
         for prefix in columns.get("prefix_column", []):
-            if not prefix:
+            if not isinstance(prefix, str) or not prefix:
                 continue
 
             input_metrics.add_text_metrics(prefix)
             arguments.body["messages"].append({"role": "system", "content": prefix})
 
         for text in columns.get("text_column", []):
-            if not text:
+            if not isinstance(text, str) or not text:
                 continue
 
             input_metrics.add_text_metrics(text)

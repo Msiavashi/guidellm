@@ -10,6 +10,7 @@ singleton operations for consistent state management across concurrent workflows
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from abc import ABC
 from collections.abc import AsyncIterator, Iterable
@@ -69,6 +70,9 @@ class Benchmarker(
         progress: (
             BenchmarkerProgress[BenchmarkAccumulatorT, BenchmarkT] | None
         ) = None,
+        delay: list[float] | None = None,
+        restart_backend_between_runs: bool = False,
+        pause_for_enter: bool = False,
     ) -> AsyncIterator[BenchmarkT]:
         """
         Execute benchmark runs across scheduling strategies in the profile.
@@ -86,6 +90,15 @@ class Benchmarker(
         :param prefer_response_metrics: Whether to prefer response metrics over
             request metrics, defaults to True
         :param progress: Optional tracker for benchmark lifecycle events
+        :param delay: List of delays in seconds before executing each benchmark run.
+            If list has fewer elements than benchmark runs, remaining delays are 0.
+            If None or empty, no delays are applied. Defaults to None.
+        :param restart_backend_between_runs: If True, restarts the backend (closes
+            and reopens connections) between each benchmark run. Ensures fresh
+            connections for each rate benchmark. Defaults to False.
+        :param pause_for_enter: If True, pauses and waits for Enter key press before
+            each benchmark run. Useful for manual inspection or coordination. Defaults
+            to False.
         :yield: Compiled benchmark result for each strategy execution
         :raises Exception: If benchmark execution or compilation fails
         """
@@ -98,8 +111,43 @@ class Benchmarker(
             strategy: SchedulingStrategy | None
             constraints: dict[str, Constraint] | None
             strategy, constraints = next(strategies_generator)
+            benchmark_count = 0
 
             while strategy is not None:
+                # Apply delay before each benchmark run based on the delay list
+                # Get delay for current benchmark (default to 0 if not specified)
+                if delay is not None and len(delay) > 0:
+                    current_delay = delay[benchmark_count] if benchmark_count < len(delay) else 0.0
+                    if current_delay > 0.0:
+                        logger.info(
+                            f"Delaying for {current_delay} seconds before benchmark run "
+                            f"{benchmark_count + 1}..."
+                        )
+                        await asyncio.sleep(current_delay)
+                
+                # Pause for Enter key press if requested
+                if pause_for_enter:
+                    rate_info = f" (run {benchmark_count + 1})"
+                    logger.info(
+                        f"Paused before benchmark{rate_info}. "
+                        "Press Enter to continue..."
+                    )
+                    # Use asyncio to run input() in executor to avoid blocking
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(None, input)
+                    logger.info("Continuing with benchmark...")
+                
+                # Restart backend between runs if requested (except for first run)
+                if restart_backend_between_runs and benchmark_count > 0:
+                    logger.info(
+                        f"Restarting backend between benchmark runs "
+                        f"(closing and reopening connections)..."
+                    )
+                    await backend.process_shutdown()
+                    await backend.process_startup()
+                    await backend.validate()
+                    logger.info("Backend restarted successfully")
+
                 if progress:
                     await progress.on_benchmark_start(strategy)
 
@@ -167,6 +215,7 @@ class Benchmarker(
                     await progress.on_benchmark_complete(benchmark)
 
                 yield benchmark
+                benchmark_count += 1
 
                 try:
                     strategy, constraints = strategies_generator.send(benchmark)

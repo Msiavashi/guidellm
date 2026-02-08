@@ -179,6 +179,30 @@ class BenchmarkGenerativeTextArgs(StandardBaseModel):
     repeat: int = Field(
         default=1, description="Number of times to repeat the phase sequence (for bursty profile)"
     )
+    delay: list[NonNegativeFloat] | None = Field(
+        default=None,
+        description=(
+            "Delay(s) in seconds before executing each benchmark run. "
+            "Can specify multiple delays to match each rate positionally. "
+            "If fewer delays than rates, remaining delays are 0. "
+            "If None or empty, no delays are applied."
+        ),
+    )
+    restart_backend_between_runs: bool = Field(
+        default=False,
+        description=(
+            "Restart the backend (close and reopen connections) between each benchmark run. "
+            "Use when server becomes unresponsive across multiple high-rate runs. "
+            "Ensures fresh connections for each rate benchmark."
+        ),
+    )
+    pause_for_enter: bool = Field(
+        default=False,
+        description=(
+            "Pause and wait for Enter key press before running each benchmark. "
+            "Useful for manual inspection, server adjustment, or coordination between runs."
+        ),
+    )
     # Backend configuration
     backend: BackendType | Backend = Field(
         default="openai_http", description="Backend type or instance for execution"
@@ -231,6 +255,37 @@ class BenchmarkGenerativeTextArgs(StandardBaseModel):
     dataloader_kwargs: dict[str, Any] | None = Field(
         default=None, description="Additional dataloader configuration arguments"
     )
+    sharegpt_preprocessor: dict[str, Any] | None = Field(
+        default=None, description="ShareGPT preprocessor configuration for conversational datasets"
+    )
+    token_budget_total: int | None = Field(
+        default=None,
+        description=(
+            "Filter dataset rows to those where input_tokens + output_tokens equals this value"
+        ),
+    )
+    max_input_length: int | None = Field(
+        default=None,
+        description=(
+            "Filter dataset rows to those where input tokens are less than or equal to this value"
+        ),
+    )
+    max_output_length: int | None = Field(
+        default=None,
+        description=(
+            "Filter dataset rows to those where output tokens are less than or equal to this value"
+        ),
+    )
+    use_filter_cache: bool = Field(
+        default=True,
+        description=(
+            "Enable caching of filtered datasets to speed up repeated runs with the same filters"
+        ),
+    )
+    input_length_stats: bool = Field(
+        default=False,
+        description="Print input length distribution (mean, p25, p50, p75, p95)",
+    )
     random_seed: int = Field(default=42, description="Random seed for reproducibility")
     # Output configuration
     outputs: list[str] | tuple[str] = Field(
@@ -243,6 +298,13 @@ class BenchmarkGenerativeTextArgs(StandardBaseModel):
     output_dir: str | Path = Field(
         default_factory=Path.cwd,
         description="The directory path to save file output types in",
+    )
+    update: bool = Field(
+        default=False,
+        description=(
+            "Update existing benchmark results instead of overwriting. "
+            "Loads existing benchmarks and replaces only matching rates."
+        ),
     )
     # Benchmarker configuration
     sample_requests: int | None = Field(
