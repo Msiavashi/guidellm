@@ -232,7 +232,7 @@ def load_text(data: str | Path, encoding: str | None = None) -> str:
 
     # check URLs
     if isinstance(data, str) and data.strip().startswith(("http", "ftp")):
-        with httpx.Client(timeout=settings.request_timeout) as client:
+        with httpx.Client(timeout=settings.request_timeout, follow_redirects=True) as client:
             response = client.get(data.strip())
             response.raise_for_status()
             return response.text
